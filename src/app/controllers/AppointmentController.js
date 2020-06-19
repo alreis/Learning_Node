@@ -1,6 +1,6 @@
 import * as Yup from 'yup';
 import {
-  startOfHour, parseISO, isBefore, format,
+  startOfHour, parseISO, isBefore, format, subHours,
 } from 'date-fns';
 import pt from 'date-fns/locale/pt';
 import User from '../models/User';
@@ -8,15 +8,18 @@ import File from '../models/File';
 import Appointment from '../models/Appointment';
 import Notification from '../Schemas/Notification';
 
+import CancellationMail from '../jobs/CancellationMail';
+import Queue from '../../lib/Queue';
+
 class AppointmentController {
   async index(req, res) {
     const { page = 1 } = req.query;
     const appointments = await Appointment.findAll({
       where: { user_id: req.userId, canceled_at: null },
       order: ['date'],
-      attributes: ['id', 'date'],
       limit: 20,
       offset: (page - 1) * 20,
+      attributes: ['id', 'date'],
       include: [{
         model: User,
         as: 'provider',
@@ -44,13 +47,14 @@ class AppointmentController {
 
     const { provider_id, date } = req.body;
 
-    const checkIsProvier = await User.findOne({
-      whare: { id: provider_id, provider: true },
+    const checkIsProvider = await User.findOne({
+      where: { id: provider_id, provider: true },
     });
 
-    if (!checkIsProvier) {
+    if (!checkIsProvider) {
       return res.status(401).json({ error: 'You can oly create appointments with providers' });
     }
+
 
     /**
      *  Check for past dates
@@ -81,6 +85,10 @@ class AppointmentController {
       date,
     });
 
+    if (provider_id === req.userId) {
+      return res.status(401).json({ error: "You can't create appointments with yourself" });
+    }
+
     /**
      * Notify appointment provider
      */
@@ -96,6 +104,38 @@ class AppointmentController {
     await Notification.create({
       content: `Novo agendamento de ${user.name} para o ${formatedDate}`,
       user: provider_id,
+    });
+
+    return res.json(appointment);
+  }
+
+  async delete(req, res) {
+    const appointment = await Appointment.findByPk(req.params.id, {
+      include: [
+        {
+          model: User,
+          as: 'provider',
+          attributes: ['name', 'email'],
+        },
+      ],
+    });
+
+    if (appointment.user_id !== req.userId) {
+      return res.status(401).json({ error: "You don't have permission to cancel this appointment." });
+    }
+
+    const dateWithSub = subHours(appointment.date, 2);
+
+    if (isBefore(dateWithSub, new Date())) {
+      return res.status(401).json({ error: 'You can only cancel appointments 2 hours in advance.' });
+    }
+
+    appointment.canceled_at = new Date();
+
+    await appointment.save();
+
+    await Queue.add(CancellationMail.key, {
+      appointment,
     });
 
     return res.json(appointment);
